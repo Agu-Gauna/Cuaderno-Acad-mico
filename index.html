@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   :root {
     --paper: #F6F3EC;
@@ -134,6 +135,32 @@
   .b-tp { color: var(--tp); background: var(--tp-bg); }
   .b-tif { color: var(--tif); background: var(--tif-bg); }
   .item-materia { font-size: 12px; color: var(--ink-soft); }
+  .drive-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    background: #fff;
+    border: 1px solid var(--paper-line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 16px;
+    font-size: 12px;
+  }
+  .drive-status { display: flex; align-items: center; gap: 6px; color: var(--ink-soft); }
+  .drive-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--done); flex-shrink: 0; }
+  .drive-dot.on { background: var(--actividad, #3E6B5C); }
+  .drive-btn {
+    font-size: 12px;
+    font-weight: 700;
+    font-family: 'Roboto', sans-serif;
+    padding: 6px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--paper-line);
+    background: var(--paper);
+    color: var(--ink);
+    cursor: pointer;
+  }
   .empty {
     text-align: center;
     padding: 40px 20px;
@@ -249,6 +276,15 @@ const TYPES = [
 ];
 const STORAGE_KEY = 'cuaderno-academico-items';
 
+const DRIVE_CLIENT_ID = '560217298313-privh6722gvl37i40l9iouoi7h2ub0rq.apps.googleusercontent.com';
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const DRIVE_FILENAME = 'cuaderno-academico-datos.json';
+
+let driveTokenClient = null;
+let driveAccessToken = null;
+let driveFileId = null;
+let driveStatus = 'disconnected';
+
 let items = [];
 let activeTab = 'todas';
 let editingId = null;
@@ -273,6 +309,160 @@ function saveItems() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
   } catch (e) {
     console.error('No se pudo guardar', e);
+  }
+  if (driveStatus === 'connected') {
+    saveToDrive();
+  }
+}
+
+function initDrive() {
+  if (!window.google || !google.accounts || !google.accounts.oauth2) {
+    setTimeout(initDrive, 300);
+    return;
+  }
+  driveTokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: DRIVE_CLIENT_ID,
+    scope: DRIVE_SCOPE,
+    callback: onDriveToken
+  });
+}
+
+function connectDrive() {
+  if (!driveTokenClient) return;
+  driveStatus = 'connecting';
+  updateDriveUI();
+  driveTokenClient.requestAccessToken({ prompt: '' });
+}
+
+function disconnectDrive() {
+  if (driveAccessToken) {
+    google.accounts.oauth2.revoke(driveAccessToken, () => {});
+  }
+  driveAccessToken = null;
+  driveFileId = null;
+  driveStatus = 'disconnected';
+  updateDriveUI();
+}
+
+async function onDriveToken(resp) {
+  if (resp.error) {
+    driveStatus = 'error';
+    updateDriveUI();
+    return;
+  }
+  driveAccessToken = resp.access_token;
+  driveStatus = 'connected';
+  updateDriveUI();
+  await syncOnConnect();
+}
+
+async function driveFetch(url, options = {}) {
+  const headers = Object.assign({}, options.headers, {
+    Authorization: 'Bearer ' + driveAccessToken
+  });
+  return fetch(url, Object.assign({}, options, { headers }));
+}
+
+async function findDriveFile() {
+  const q = encodeURIComponent(`name='${DRIVE_FILENAME}' and trashed=false`);
+  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&spaces=drive&fields=files(id,name)`);
+  const data = await res.json();
+  if (data.files && data.files.length > 0) {
+    return data.files[0].id;
+  }
+  return null;
+}
+
+async function createDriveFile(content) {
+  const metadata = { name: DRIVE_FILENAME, mimeType: 'application/json' };
+  const boundary = 'cuaderno_boundary';
+  const body =
+    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
+    `--${boundary}\r\nContent-Type: application/json\r\n\r\n${content}\r\n--${boundary}--`;
+  const res = await driveFetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
+    method: 'POST',
+    headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
+    body
+  });
+  const data = await res.json();
+  return data.id;
+}
+
+async function updateDriveFile(fileId, content) {
+  await driveFetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: content
+  });
+}
+
+async function readDriveFile(fileId) {
+  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
+  return res.text();
+}
+
+async function syncOnConnect() {
+  try {
+    driveFileId = await findDriveFile();
+    if (driveFileId) {
+      const remoteText = await readDriveFile(driveFileId);
+      const remoteItems = remoteText ? JSON.parse(remoteText) : [];
+      items = remoteItems;
+      saveItemsLocalOnly();
+      render();
+    } else {
+      driveFileId = await createDriveFile(JSON.stringify(items));
+    }
+  } catch (e) {
+    console.error('Error sincronizando con Drive', e);
+    driveStatus = 'error';
+  }
+  updateDriveUI();
+}
+
+function saveItemsLocalOnly() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+  } catch (e) {}
+}
+
+let driveSaveTimer = null;
+function saveToDrive() {
+  clearTimeout(driveSaveTimer);
+  driveSaveTimer = setTimeout(async () => {
+    try {
+      if (!driveFileId) {
+        driveFileId = await createDriveFile(JSON.stringify(items));
+      } else {
+        await updateDriveFile(driveFileId, JSON.stringify(items));
+      }
+    } catch (e) {
+      console.error('Error guardando en Drive', e);
+    }
+  }, 800);
+}
+
+function updateDriveUI() {
+  const dot = document.getElementById('drive-dot');
+  const text = document.getElementById('drive-status-text');
+  const btn = document.getElementById('drive-btn');
+  if (!dot || !text || !btn) return;
+  if (driveStatus === 'connected') {
+    dot.classList.add('on');
+    text.textContent = 'Google Drive: conectado';
+    btn.textContent = 'Desconectar';
+  } else if (driveStatus === 'connecting') {
+    dot.classList.remove('on');
+    text.textContent = 'Google Drive: conectando...';
+    btn.textContent = 'Conectar';
+  } else if (driveStatus === 'error') {
+    dot.classList.remove('on');
+    text.textContent = 'Google Drive: hubo un error, reintentá';
+    btn.textContent = 'Conectar';
+  } else {
+    dot.classList.remove('on');
+    text.textContent = 'Google Drive: no conectado';
+    btn.textContent = 'Conectar';
   }
 }
 
@@ -318,6 +508,13 @@ function render() {
     <div class="stats">
       <span>${pendientes} pendiente${pendientes===1?'':'s'}</span>
       ${vencidas > 0 ? `<span style="color:var(--tif); font-weight:700;">· ${vencidas} vencida${vencidas===1?'':'s'}</span>` : ''}
+    </div>
+    <div class="drive-bar" id="drive-bar">
+      <div class="drive-status">
+        <span class="drive-dot" id="drive-dot"></span>
+        <span id="drive-status-text">Google Drive: no conectado</span>
+      </div>
+      <button class="drive-btn" id="drive-btn">Conectar</button>
     </div>
     <div class="tabs" id="tabs"></div>
     <div class="item-list" id="list"></div>
@@ -379,6 +576,15 @@ function render() {
     fab.onclick = () => openSheet(null);
     document.body.appendChild(fab);
   }
+
+  updateDriveUI();
+  document.getElementById('drive-btn').onclick = () => {
+    if (driveStatus === 'connected') {
+      disconnectDrive();
+    } else {
+      connectDrive();
+    }
+  };
 }
 
 function escapeHtml(s) {
@@ -493,6 +699,7 @@ document.getElementById('overlay').addEventListener('click', (e) => {
 });
 
 loadItems();
+initDrive();
 </script>
 </body>
 </html>
